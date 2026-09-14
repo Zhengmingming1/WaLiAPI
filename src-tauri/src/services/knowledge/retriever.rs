@@ -100,6 +100,23 @@ pub async fn search(
                     })
                     .collect();
 
+                // 切片事务先提交，后台索引随后更新；索引写入失败时差异还会持续。
+                // 只有有效节点与当前可检索切片完全一致才能采用近邻结果，
+                // 否则部分旧命中会掩盖新切片，或因删除节点而少返回结果。
+                let matches_chunks = index.len() == chunk_map.len()
+                    && index
+                        .nodes
+                        .iter()
+                        .filter(|node| !index.tombstones.contains(&node.id))
+                        .all(|node| chunk_map.contains_key(&node.id));
+                if !matches_chunks {
+                    tracing::debug!(
+                        "HNSW snapshot for KB {} is outdated, using linear scan",
+                        kb_id
+                    );
+                    return linear_search(pool, kb_id, query_embedding, top_k).await;
+                }
+
                 // Map chunk ID -> chunk data
                 let mapped: Vec<SearchResult> = hnsw_results
                     .into_iter()
