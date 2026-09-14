@@ -191,13 +191,14 @@ impl KbRepository {
             .await
     }
 
+    /// 已失败的摄入不构成有效重复，允许修复配置后重新导入相同内容。
     pub async fn find_document_by_hash(
         &self,
         kb_id: &str,
         hash: &str,
     ) -> Result<Option<KbDocument>, sqlx::Error> {
         sqlx::query_as::<_, KbDocument>(
-            "SELECT * FROM kb_documents WHERE kb_id = ? AND content_hash = ?",
+            "SELECT * FROM kb_documents WHERE kb_id = ? AND content_hash = ? AND status != 'failed'",
         )
         .bind(kb_id)
         .bind(hash)
