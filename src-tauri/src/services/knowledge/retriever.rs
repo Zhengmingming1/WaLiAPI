@@ -217,6 +217,77 @@ async fn linear_search(
     Ok(results)
 }
 
+/// 管理命令与 REST 共用的文本检索入口，单库按指定模式执行。
+#[allow(clippy::too_many_arguments)]
+pub async fn search_query(
+    pool: &SqlitePool,
+    kb_id: Option<&str>,
+    query: &str,
+    top_k: usize,
+    search_mode: &str,
+    vector_weight: f32,
+    keyword_weight: f32,
+    fusion_mode: FusionMode,
+) -> Result<Vec<SearchResult>, String> {
+    let kb_id = kb_id.filter(|id| !id.is_empty());
+    if !matches!(search_mode, "keyword" | "vector" | "hybrid") {
+        return Err("不支持的检索模式".to_string());
+    }
+    let total_weight = vector_weight + keyword_weight;
+    if !vector_weight.is_finite()
+        || !keyword_weight.is_finite()
+        || vector_weight < 0.0
+        || keyword_weight < 0.0
+        || !total_weight.is_finite()
+        || total_weight <= 0.0
+    {
+        return Err("检索权重必须是有限非负数，且总和大于零".to_string());
+    }
+    // 跨库接口原本仅支持向量搜索，不能把显式指定的其他模式静默降级。
+    if kb_id.is_none() && search_mode != "vector" {
+        return Err("关键词或混合检索需要指定知识库".to_string());
+    }
+    if let Some(kb_id) = kb_id {
+        if search_mode == "keyword" {
+            return keyword_only_search(pool, kb_id, query, top_k).await;
+        }
+    }
+
+    let model = if let Some(kb_id) = kb_id {
+        KbRepository::new(pool.clone())
+            .get_kb(kb_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .embedding_model
+    } else {
+        None
+    };
+    let embeddings = super::embedder::embed(
+        &[query.to_string()],
+        model.as_deref().unwrap_or("text-embedding-3-small"),
+        &crate::db::repository::Repository::new(pool.clone()),
+    )
+    .await?;
+    let embedding = embeddings.first().ok_or("Failed to embed query")?;
+    match kb_id {
+        Some(kb_id) if search_mode == "hybrid" => {
+            hybrid_search(
+                pool,
+                kb_id,
+                query,
+                embedding,
+                top_k,
+                vector_weight,
+                keyword_weight,
+                fusion_mode,
+            )
+            .await
+        }
+        Some(kb_id) => search(pool, kb_id, embedding, top_k).await,
+        None => search_all(pool, embedding, top_k, false).await,
+    }
+}
+
 /// Search across all knowledge bases.
 /// If mcp_only is true, only search KBs with mcp_enabled = 1.
 pub async fn search_all(

@@ -1,4 +1,3 @@
-use crate::db::repository::Repository;
 use crate::services::knowledge::{models::*, repository::KbRepository};
 use crate::AppState;
 use serde::Deserialize;
@@ -255,39 +254,19 @@ pub async fn search_knowledge_base(
     state: State<'_, Arc<AppState>>,
     input: KbSearchInput,
 ) -> Result<Vec<SearchResult>, String> {
-    let pool = &state.db.pool;
-    let repo = Repository::new(pool.clone());
-
-    let emb_model = if let Some(kb_id) = &input.kb_id {
-        let kb_repo = KbRepository::new(pool.clone());
-        kb_repo
-            .get_kb(kb_id)
-            .await
-            .ok()
-            .and_then(|kb| kb.embedding_model)
-            .unwrap_or_else(|| "text-embedding-3-small".to_string())
-    } else {
-        "text-embedding-3-small".to_string()
-    };
-
-    let embeddings =
-        crate::services::knowledge::embedder::embed(&[input.query.clone()], &emb_model, &repo)
-            .await
-            .map_err(|e| e)?;
-
-    if embeddings.is_empty() {
-        return Err("Failed to embed query".to_string());
-    }
-
-    let results = if let Some(kb_id) = &input.kb_id {
-        crate::services::knowledge::retriever::search(pool, kb_id, &embeddings[0], input.top_k)
-            .await
-    } else {
-        crate::services::knowledge::retriever::search_all(pool, &embeddings[0], input.top_k, false)
-            .await
-    };
-
-    results.map_err(|e| e.to_string())
+    crate::services::knowledge::retriever::search_query(
+        &state.db.pool,
+        input.kb_id.as_deref(),
+        &input.query,
+        input.top_k,
+        input.search_mode.as_deref().unwrap_or("vector"),
+        input.vector_weight.unwrap_or(0.7),
+        input.keyword_weight.unwrap_or(0.3),
+        crate::services::knowledge::retriever::FusionMode::parse(
+            &state.settings.get_str("kb.fusion_mode", "rrf"),
+        ),
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]

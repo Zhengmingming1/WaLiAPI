@@ -1,10 +1,8 @@
-use super::embedder;
 use super::models::*;
 use super::processor;
 use super::rag;
 use super::repository::KbRepository;
 use super::retriever;
-use crate::db::repository::Repository;
 use crate::server::knowledge_access::{self, KnowledgeAccess};
 use crate::server::router::SharedState;
 use axum::{
@@ -331,6 +329,8 @@ pub struct SearchQuery {
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     pub search_mode: Option<String>,
+    pub vector_weight: Option<f32>,
+    pub keyword_weight: Option<f32>,
 }
 
 fn default_top_k() -> usize {
@@ -343,52 +343,30 @@ pub async fn search(
     access: Option<Extension<KnowledgeAccess>>,
 ) -> Response {
     if let Some(Extension(access)) = access {
-        let input: AskInput = serde_json::from_value(serde_json::json!({
+        let mut input: AskInput = serde_json::from_value(serde_json::json!({
             "question": query.q, "kb_id": query.kb_id, "top_k": query.top_k,
             "search_mode": query.search_mode.unwrap_or_else(|| "vector".into()),
         }))
         .expect("valid search input");
+        // 保留非有限数供权限入口校验，避免 JSON 序列化将其变成 null 后套用默认值。
+        input.vector_weight = query.vector_weight;
+        input.keyword_weight = query.keyword_weight;
         return match knowledge_access::search(&shared, &access, input, false).await {
             Ok(results) => Json(serde_json::json!({"data": results})).into_response(),
             Err(error) => error.into_response(),
         };
     }
-    let repo = Repository::new(shared.state.db.pool.clone());
-
-    let emb_model = if let Some(kb_id) = &query.kb_id {
-        let kb_repo = KbRepository::new(shared.state.db.pool.clone());
-        kb_repo
-            .get_kb(kb_id)
-            .await
-            .ok()
-            .and_then(|kb| kb.embedding_model)
-            .unwrap_or_else(|| "text-embedding-3-small".to_string())
-    } else {
-        "text-embedding-3-small".to_string()
-    };
-
-    let embeddings = match embedder::embed(&[query.q.clone()], &emb_model, &repo).await {
-        Ok(e) => e,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Embedding failed: {}", e),
-            )
-                .into_response()
-        }
-    };
-
-    if embeddings.is_empty() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to embed query").into_response();
-    }
-
-    let query_emb = &embeddings[0];
-
-    let results = if let Some(kb_id) = &query.kb_id {
-        retriever::search(&shared.state.db.pool, kb_id, query_emb, query.top_k).await
-    } else {
-        retriever::search_all(&shared.state.db.pool, query_emb, query.top_k, false).await
-    };
+    let results = retriever::search_query(
+        &shared.state.db.pool,
+        query.kb_id.as_deref(),
+        &query.q,
+        query.top_k,
+        query.search_mode.as_deref().unwrap_or("vector"),
+        query.vector_weight.unwrap_or(0.7),
+        query.keyword_weight.unwrap_or(0.3),
+        retriever::FusionMode::parse(&shared.state.settings.get_str("kb.fusion_mode", "rrf")),
+    )
+    .await;
 
     match results {
         Ok(results) => Json(serde_json::json!({ "data": results })).into_response(),
