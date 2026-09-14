@@ -111,50 +111,57 @@ async fn try_embed_with_channel(
         .await
         .map_err(|e| format!("Parse response failed: {}", e))?;
 
-    let data = json
+    parse_embedding_response(&json, texts.len())
+}
+
+/// 按响应索引还原输入顺序，整批校验后才允许调用方写入文档切片。
+/// 兼容完全不提供 index 的旧渠道；一旦提供索引就必须完整且唯一。
+pub(crate) fn parse_embedding_response(
+    response: &serde_json::Value,
+    expected_count: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    let data = response
         .get("data")
-        .and_then(|d| d.as_array())
+        .and_then(serde_json::Value::as_array)
         .ok_or("Invalid embedding response: missing data array")?;
-
-    let embeddings: Vec<Vec<f32>> = data
-        .iter()
-        .filter_map(|item| {
-            item.get("embedding").and_then(|e| e.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_f64().map(|f| f as f32))
-                    .collect()
-            })
-        })
-        .collect();
-
-    if embeddings.len() != texts.len() {
+    if data.len() != expected_count {
         return Err(format!(
             "Embedding count mismatch: expected {}, got {}",
-            texts.len(),
-            embeddings.len()
+            expected_count,
+            data.len()
         ));
     }
 
-    // Validate all embeddings have same dimension
-    if !embeddings.is_empty() {
-        let dim = embeddings[0].len();
-        for (i, emb) in embeddings.iter().enumerate().skip(1) {
-            if emb.len() != dim {
-                return Err(format!(
-                    "Inconsistent embedding dimensions: item 0 has dim {}, item {} has dim {}",
-                    dim,
-                    i,
-                    emb.len()
-                ));
-            }
+    let indexed = data.iter().any(|item| item.get("index").is_some());
+    let mut embeddings = vec![Vec::new(); expected_count];
+    let mut dimension = None;
+    for (position, item) in data.iter().enumerate() {
+        let index = if indexed {
+            item.get("index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|&index| index < expected_count)
+                .ok_or_else(|| format!("Invalid embedding index at item {position}"))?
+        } else {
+            position
+        };
+        if !embeddings[index].is_empty() {
+            return Err(format!("Duplicate embedding index: {index}"));
         }
-        tracing::debug!(
-            "Embeddings validated: {} items, dim {}",
-            embeddings.len(),
-            dim
-        );
+        let embedding: Vec<f32> =
+            serde_json::from_value(item.get("embedding").cloned().unwrap_or_default())
+                .map_err(|_| format!("Embedding item {position} is not a float vector"))?;
+        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+            return Err(format!("Invalid embedding vector at item {position}"));
+        }
+        if dimension.is_some_and(|dim| dim != embedding.len()) {
+            return Err(format!(
+                "Inconsistent embedding dimensions at item {position}"
+            ));
+        }
+        dimension = Some(embedding.len());
+        embeddings[index] = embedding;
     }
-
     Ok(embeddings)
 }
 

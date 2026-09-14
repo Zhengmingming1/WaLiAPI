@@ -91,22 +91,8 @@ impl ModelClient<'_> {
                 )
                 .await;
                 let value = read_gateway_response(response).await?;
-                let embedding: Vec<f32> = serde_json::from_value(
-                    value["data"][0]["embedding"].clone(),
-                )
-                .map_err(|_| {
-                    QueryError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "Embedding response has no float vector",
-                    )
-                })?;
-                if embedding.is_empty() || embedding.iter().any(|v| !v.is_finite()) {
-                    return Err(QueryError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "Invalid embedding vector",
-                    ));
-                }
-                Ok(vec![embedding])
+                embedder::parse_embedding_response(&value, 1)
+                    .map_err(|error| QueryError::new(StatusCode::BAD_GATEWAY, error))
             }
         }
     }
